@@ -115,11 +115,13 @@ fl["prev_filed"] = g["filed"].shift(1)
 gap = (fl["end"] - fl["prev_end"]).dt.days
 direct_q = (fl.days >= 80) & (fl.days <= 100)
 derived = fl.prev_end.notna() & (gap >= 80) & (gap <= 100)
-fl["qval"] = np.where(direct_q, fl.val, np.where(derived, fl.val - fl.prev_val, np.nan))
+POINT_FIELDS = {"diluted_shares", "dps"}          # weighted averages and per-share figures are not additive (audit N4)
+is_point = fl.field.isin(POINT_FIELDS).values
+fl["qval"] = np.where(direct_q, fl.val, np.where(derived & ~is_point, fl.val - fl.prev_val, np.nan))
 fl["qfiled"] = np.where(derived & ~direct_q, np.maximum(fl.filed, fl.prev_filed), fl.filed)
 mem("after derive"); fl["qfiled"] = pd.to_datetime(fl["qfiled"])
 # Q4 = FY - (Q1 + Q2 + Q3) for filers that tag discrete quarters but no 9-month YTD (audit F6.1)
-fy = fl[(fl.days >= 350) & (fl.days <= 380) & fl.qval.isna()][["cik", "tag", "start", "end", "val", "filed"]]
+fy = fl[(fl.days >= 350) & (fl.days <= 380) & fl.qval.isna() & ~fl.field.isin(POINT_FIELDS)][["cik", "tag", "start", "end", "val", "filed"]]
 dq = fl[direct_q.reindex(fl.index, fill_value=False)][["cik", "tag", "start", "end", "qval", "qfiled"]]
 if len(fy) and len(dq):
     _c = duckdb.connect()
@@ -183,8 +185,11 @@ qq = qq.sort_values("end"); ss = ss.sort_values("end")
 m = pd.merge_asof(qq, ss, on="end", by="cik", tolerance=pd.Timedelta(days=7), direction="nearest")
 m = m.sort_values("end")
 cv = cv.sort_values("cover_date")
-m = pd.merge_asof(m, cv.rename(columns={"shares_out": "cover_shares", "public_float": "cover_float"}), left_on="end", right_on="cover_date", by="cik",
-                  tolerance=pd.Timedelta(days=75), direction="forward")
+cv["cover_key"] = cv.cover_date + pd.Timedelta(days=7)   # covers dated up to 7 days before a quarter end (weekend month-ends) map forward to it (audit N2)
+cv = cv.sort_values("cover_key")
+m = pd.merge_asof(m, cv.rename(columns={"shares_out": "cover_shares", "public_float": "cover_float"}), left_on="end", right_on="cover_key", by="cik",
+                  tolerance=pd.Timedelta(days=82), direction="forward")
+m = m.drop(columns=["cover_key"])
 m["shares_out"] = m["cover_shares"].where(m["cover_shares"].notna(), m.get("shares_out"))
 m["public_float"] = m["cover_float"].where(m["cover_float"].notna(), m.get("public_float"))
 m = m.sort_values(["cik", "end"]).reset_index(drop=True)
@@ -199,11 +204,12 @@ has_oi = m.groupby("cik").q_op_income.transform(lambda x: x.notna().any())
 m["q_op_income_src"] = np.where(has_oi, "operating_income", np.where(m.q_pretax_income.notna(), "pretax_income", "none"))
 m["q_op_income"] = m.q_op_income.where(has_oi, m.q_pretax_income)
 # bank/insurer revenue proxy when no revenue tag: interest and dividend income + non-interest income (gross), else premiums
-m["q_revenue_src"] = np.where(m["q_revenue"].notna(), "revenue",
-                     np.where(m["q_interest_income"].notna() & m["q_noninterest_income"].notna(), "bank_gross",
-                     np.where(m["q_premiums"].notna(), "premiums", "none")))
-m["q_revenue"] = m["q_revenue"].where(m["q_revenue"].notna(),
-                 (m["q_interest_income"] + m["q_noninterest_income"]).where(m["q_interest_income"].notna() & m["q_noninterest_income"].notna(), m["q_premiums"]))
+bank_gross = (m["q_interest_income"] + m["q_noninterest_income"]).where(m["q_interest_income"].notna() & m["q_noninterest_income"].notna())
+cands = {"revenue": m["q_revenue"], "bank_gross": bank_gross, "premiums": m["q_premiums"]}
+cov = pd.DataFrame({k: v.notna().groupby(m.cik).transform("sum") for k, v in cands.items()})
+pick = cov.idxmax(axis=1).where(cov.max(axis=1) > 0, "none")       # one revenue definition per company: the longest coverage (audit N9)
+m["q_revenue_src"] = pick
+m["q_revenue"] = np.select([pick == "revenue", pick == "bank_gross", pick == "premiums"], [m["q_revenue"], bank_gross, m["q_premiums"]], np.nan)
 ttm_fields = ["revenue", "gross_profit", "op_income", "net_income", "cfo", "capex", "sbc", "rnd", "da", "buybacks", "dividends_paid", "issuance",
               "pretax_income", "interest_income", "noninterest_income", "net_interest_income"]
 gm = m.groupby("cik", sort=False)

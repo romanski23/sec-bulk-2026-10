@@ -29,6 +29,7 @@ prices, quarterly, outcomes, tickers_csv, out = sys.argv[1:6]
 cik_links = sys.argv[6] if len(sys.argv) > 6 else None
 out = Path(out); out.mkdir(parents=True, exist_ok=True)
 STALE_DAYS = 455      # fundamentals older than 15 months before the snapshot are treated as missing (audit F6.2)
+CAP_MAX = 3.0e12      # no US company exceeded US$3T at any snapshot through 2021 (Apple 2.9T at end-2021); above it is an XBRL scale error
 con = duckdb.connect()
 con.execute(f"CREATE VIEW p AS SELECT * FROM '{prices}'")
 cal = con.execute("SELECT date FROM p WHERE ticker='SPY' ORDER BY date").df()["date"]
@@ -64,6 +65,8 @@ liq["snap"] = pd.to_datetime(liq["snap"])
 # special dividends / spin-offs booked as dividends: any single dividend above 25% of that day's close
 bigdiv = con.execute("SELECT ticker, MIN(date) AS first_big_div, MAX(dividends / close) AS max_div_ratio FROM p WHERE close > 0 AND dividends / close > 0.25 GROUP BY ticker").df()
 bigdiv["first_big_div"] = pd.to_datetime(bigdiv["first_big_div"])
+bigdiv_dates = con.execute("SELECT ticker, date FROM p WHERE close > 0 AND dividends / close > 0.25").df()
+bigdiv_dates["date"] = pd.to_datetime(bigdiv_dates.date)
 # spin-offs booked by Yahoo as split factors (e.g. DELL 1.973 for VMware, GE 1.253 for the 2023 spin). Ordinary splits,
 # reverse splits and stock dividends are simple ratios (n/m with n, m <= 10; integers and 1/integers to 100; within 2% of 1); anything else is flagged.
 allsplits = con.execute("SELECT ticker, date, stock_splits FROM p WHERE stock_splits > 0").df()
@@ -80,6 +83,7 @@ lastpx["last_date"] = pd.to_datetime(lastpx["last_date"]); lastpx["first_date"] 
 tk = pd.read_csv(tickers_csv)
 if "is_primary" in tk:
     tk = tk[tk.is_primary]
+tk = tk[~tk.ticker.str.contains(r"-P[A-Z]?$|-PR[A-Z]?$", regex=True)]     # preferred-share tickers (audit N13)
 tk = tk[["ticker", "cik", "exchange", "name", "sic"]]
 tk["cik"] = tk["cik"].astype(int)
 links = pd.read_csv(cik_links) if cik_links else pd.DataFrame(columns=["ticker", "pred_cik", "succ_first_10k"])
@@ -90,7 +94,21 @@ q = pd.read_parquet(quarterly, columns=["cik", "end", "filed", "bs_filed", "avai
                                         "ttm_revenue", "ttm_op_income", "ttm_fcf",
                                         "ttm_net_income", "ttm_cfo", "ttm_capex", "ttm_pretax_income", "assets", "equity", "cash", "lt_debt", "st_debt",
                                         "q_cfo", "q_capex", "ttm_sbc", "ttm_rnd", "ttm_gross_profit", "q_diluted_shares", "q_revenue_src", "q_op_income_src"])
-floats = q.loc[q.public_float.notna() & q.cover_filed.notna() & (q.public_float > 0), ["cik", "cover_date", "cover_filed", "public_float"]].drop_duplicates()
+floats = q.loc[q.public_float.notna() & q.cover_filed.notna() & (q.public_float > 1e6), ["cik", "cover_date", "cover_filed", "public_float"]].drop_duplicates()
+
+def fix_float_scale(fl, val="public_float", by="cik", order="cover_date"):
+    """In-thousands float errors by continuity: a value >100x the company's previous float whose thousandth is within 10x of it."""
+    fl = fl.sort_values([by, order]).copy()
+    prev = fl.groupby(by)[val].shift(1)
+    nxt = fl.groupby(by)[val].shift(-1)
+    ref = prev.where(prev.notna(), nxt)
+    k = ref.notna() & (fl[val] > 100 * ref) & ((fl[val] / 1000 / ref).between(0.1, 10))
+    fl.loc[k, val] = fl.loc[k, val] / 1000
+    fl["float_scaled_1000"] = k
+    return fl
+
+floats = fix_float_scale(floats)
+floats = floats[floats.public_float < CAP_MAX]
 q = q[q.filed.notna() & (q.filed >= q["end"])]
 q["bs_filed"] = q.bs_filed.where(q.bs_filed.notna(), q.filed)
 STOCK_COLS = ["cik", "end", "bs_filed", "shares_out", "cover_shares", "public_float", "assets", "equity", "cash", "lt_debt", "st_debt", "q_diluted_shares", "q_cfo", "q_capex"]
@@ -121,17 +139,36 @@ for y in SNAPS:
     qf = q.loc[(q.avail <= d) & (q["end"] >= d - pd.Timedelta(days=STALE_DAYS)), FLOW_COLS].dropna(subset=["ttm_revenue", "ttm_op_income", "ttm_cfo"], how="all") \
           .sort_values(["cik", "end"]).drop_duplicates("cik", keep="last").rename(columns={"end": "ttm_end"})
     fl_d = floats[(floats.cover_filed <= d) & (floats.cover_date >= d - pd.Timedelta(days=730))].sort_values(["cik", "cover_date"]).drop_duplicates("cik", keep="last")
-    u = u.merge(qs, on="cik", how="left").merge(qf, on="cik", how="left").merge(fl_d[["cik", "public_float"]].rename(columns={"public_float": "float_latest"}), on="cik", how="left")
+    u = u.merge(qs, on="cik", how="left").merge(qf, on="cik", how="left").merge(fl_d[["cik", "public_float", "float_scaled_1000"]].rename(columns={"public_float": "float_latest"}), on="cik", how="left")
     u["split_factor_after"] = u.ticker.map(later_split_factors(d)).fillna(1.0)
     u["close_unadj"] = u.close * u.split_factor_after
     # share count chain (audit F5.1/F5.2): cover count -> balance-sheet count -> diluted weighted average -> public float as a
     # cap proxy for multi-class issuers whose total is not in companyfacts (labelled approximate)
     bs_shares = u.shares_out.where(u.cover_shares.isna(), np.nan)
-    u["shares_used"] = u.cover_shares.where(u.cover_shares.notna(), bs_shares.where(bs_shares.notna(), u.q_diluted_shares))
-    u["shares_source"] = np.where(u.cover_shares.notna(), "cover", np.where(bs_shares.notna(), "balance_sheet",
-                         np.where(u.q_diluted_shares.notna(), "diluted_wavg", np.where(u.float_latest.notna(), "public_float_approx", "none"))))
+    def pos(x):
+        return x.where(x > 0)
+    u["shares_used"] = pos(u.cover_shares).where(pos(u.cover_shares).notna(), pos(bs_shares).where(pos(bs_shares).notna(), pos(u.q_diluted_shares)))
+    u["shares_source"] = np.where(pos(u.cover_shares).notna(), "cover", np.where(pos(bs_shares).notna(), "balance_sheet",
+                         np.where(pos(u.q_diluted_shares).notna(), "diluted_wavg", "none")))
     u["mcap"] = u.close_unadj * u.shares_used
-    u["mcap"] = u.mcap.where(u.mcap.notna(), u.float_latest)
+    # plausibility (audit N3, N12): a cap above 20x or below 1/20 of the company's own public float, or above US$5T, is an XBRL scale
+    # error in the share count; fall back to the float proxy, else missing
+    k = u.mcap.notna() & (u.mcap > CAP_MAX) & (u.mcap / 1000 > 1e7) & (u.mcap / 1000 < CAP_MAX)   # share count tagged in thousands
+    u.loc[k, "mcap"] = u.loc[k, "mcap"] / 1000; u.loc[k, "shares_used"] = u.loc[k, "shares_used"] / 1000
+    u.loc[k, "shares_source"] = u.loc[k, "shares_source"] + "_div1000"
+    implausible = u.mcap.notna() & ((u.mcap > CAP_MAX) | (u.float_latest.notna() & ((u.mcap > 20 * u.float_latest) | (u.mcap < u.float_latest / 20))))
+    u.loc[implausible, "mcap"] = np.nan
+    u.loc[implausible, "shares_source"] = "implausible_" + u.loc[implausible, "shares_source"]
+    # float proxy scale check against the company's own size (assets, revenue)
+    ref_a = np.where(u.assets.notna(), 30 * u.assets, np.inf); ref_r = np.where(u.ttm_revenue.notna(), 100 * u.ttm_revenue, np.inf)
+    ref = np.where(np.isinf(ref_a) & np.isinf(ref_r), 300e9, np.maximum(np.where(np.isinf(ref_a), 0, ref_a), np.where(np.isinf(ref_r), 0, ref_r)))
+    bad_float = u.float_latest.notna() & (u.float_latest > ref)
+    k = bad_float & (u.float_latest / 1000 > 1e7) & (u.float_latest / 1000 <= ref)      # "in thousands" float
+    u.loc[k, "float_latest"] = u.loc[k, "float_latest"] / 1000
+    u.loc[bad_float & ~k, "float_latest"] = np.nan
+    use_float = u.mcap.isna() & u.float_latest.notna()
+    u.loc[use_float, "mcap"] = u.loc[use_float, "float_latest"]
+    u.loc[use_float, "shares_source"] = "public_float_approx"
     u["mcap_approx"] = u.shares_source == "public_float_approx"
     u["snapshot"] = y
     u["snap_date"] = d
@@ -169,10 +206,15 @@ U["win_5x5y"] = U.eligible & (U.mult_peak_5y >= 5)
 U["headline_10y"] = U.eligible & U.window_complete_10y
 U["headline_5y"] = U.eligible & U.window_complete_5y
 # flags inside the forward window (corporate actions that could distort the outcome), reported with and without
-U["flag_in_window_10y"] = ((U.first_big_div > U.snap_date) & (U.first_big_div <= U.snap_date + pd.DateOffset(years=10))) | \
-                          ((U.first_odd_split > U.snap_date) & (U.first_odd_split <= U.snap_date + pd.DateOffset(years=10)))
-U["flag_in_window_5y"] = ((U.first_big_div > U.snap_date) & (U.first_big_div <= U.snap_date + pd.DateOffset(years=5))) | \
-                         ((U.first_odd_split > U.snap_date) & (U.first_odd_split <= U.snap_date + pd.DateOffset(years=5)))
+action_dates = pd.concat([bigdiv_dates, allsplits.loc[allsplits.odd, ["ticker", "date"]]]).drop_duplicates()
+action_dates["date"] = pd.to_datetime(action_dates.date)
+def any_in_window(years):
+    j = U[["ticker", "snapshot", "snap_date"]].merge(action_dates, on="ticker", how="inner")
+    j = j[(j.date > j.snap_date) & (j.date <= j.snap_date + pd.DateOffset(years=years))]
+    hit = set(zip(j.ticker, j.snapshot))
+    return pd.Series([(t, y) in hit for t, y in zip(U.ticker, U.snapshot)], index=U.index)
+U["flag_in_window_10y"] = any_in_window(10)   # any big dividend or odd split inside the window (audit N6)
+U["flag_in_window_5y"] = any_in_window(5)
 U["outcome_uncertain"] = (U.adj_source != "reference") & (U.flag_in_window_10y | U.flag_in_window_5y)
 U["dead"] = (U.last_date < LAST_DATE - pd.Timedelta(days=10))
 U.to_parquet(out / "universe.parquet", index=False)
