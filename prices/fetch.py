@@ -120,7 +120,7 @@ def save(frame):
     for c, dt in SCHEMA.items():
         if c in frame:
             frame[c] = frame[c].astype(dt)
-    frame[COLS].to_parquet(RAW / f"{t}.parquet", index=False)
+    frame[["ticker"] + COLS].to_parquet(RAW / f"{t}.parquet", index=False)
     return {"ticker": t, "status": "ok", "source": frame["source"].iloc[0], "rows": len(frame),
             "first": frame["date"].min().date(), "last": frame["date"].max().date()}
 
