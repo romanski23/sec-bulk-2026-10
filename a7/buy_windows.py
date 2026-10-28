@@ -22,13 +22,15 @@ import numpy as np
 import pandas as pd
 
 prices, winners, out = sys.argv[1:4]
+SUFFIX = sys.argv[4] if len(sys.argv) > 4 else ""          # e.g. "_all" when `winners` is the whole eligible universe (precision denominator)
 out = Path(out); out.mkdir(parents=True, exist_ok=True)
 HURDLES = (0.20, 0.25, 0.30)
 TOLS = (0.25, 0.40)
 HEADLINE = "h25_t25"
 
 con = duckdb.connect()
-tickers = sorted(set(pd.read_parquet(winners).ticker))
+src = pd.read_parquet(winners)
+tickers = sorted(set(src[src.eligible].ticker if "eligible" in src else src.ticker))
 me = con.execute(f"""
     SELECT ticker, date, adj_close FROM (
         SELECT ticker, date, adj_close, ROW_NUMBER() OVER (PARTITION BY ticker, date_trunc('month', date) ORDER BY date DESC) rn
@@ -120,10 +122,10 @@ for t, g in me.groupby("ticker", sort=False):
 L = pd.concat(label_rows, ignore_index=True)
 R = pd.DataFrame(run_rows)
 S = pd.DataFrame(shape_rows)
-L.to_parquet(out / "month_labels.parquet", index=False)
-pd.DataFrame(early_rows).to_parquet(out / "too_early_months.parquet", index=False)
-R.to_parquet(out / "runs.parquet", index=False)
-S.to_parquet(out / "winner_shapes.parquet", index=False)
+L.to_parquet(out / f"month_labels{SUFFIX}.parquet", index=False)
+pd.DataFrame(early_rows).to_parquet(out / f"too_early_months{SUFFIX}.parquet", index=False)
+R.to_parquet(out / f"runs{SUFFIX}.parquet", index=False)
+S.to_parquet(out / f"winner_shapes{SUFFIX}.parquet", index=False)
 
 print(f"winners with price history: {L.ticker.nunique()}; month rows {len(L):,}")
 for key in sorted(S.setting.unique()):

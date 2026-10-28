@@ -76,6 +76,7 @@ def is_simple(f):
 allsplits["odd"] = ~allsplits.stock_splits.map(is_simple)
 oddsplit = allsplits[allsplits.odd].groupby("ticker").agg(first_odd_split=("date", "min"), n_odd_splits=("date", "size")).reset_index()
 oddsplit["first_odd_split"] = pd.to_datetime(oddsplit["first_odd_split"])
+badpx = set(x[0] for x in con.execute("SELECT DISTINCT ticker FROM p WHERE adj_close <= 0 OR close <= 0").fetchall())   # corrupted series (audit N17)
 # last price per ticker
 lastpx = con.execute("SELECT ticker, MAX(date) last_date, MIN(date) first_date FROM p GROUP BY ticker").df()
 lastpx["last_date"] = pd.to_datetime(lastpx["last_date"]); lastpx["first_date"] = pd.to_datetime(lastpx["first_date"])
@@ -90,6 +91,8 @@ links = pd.read_csv(cik_links) if cik_links else pd.DataFrame(columns=["ticker",
 links = links[links.pred_cik.notna()]
 links["pred_cik"] = links.pred_cik.astype(int)
 links["succ_first_10k"] = pd.to_datetime(links.succ_first_10k)
+if "until" in links:
+    links["until"] = pd.to_datetime(links.until)
 q = pd.read_parquet(quarterly, columns=["cik", "end", "filed", "bs_filed", "avail", "shares_out", "cover_shares", "public_float", "cover_date", "cover_filed",
                                         "ttm_revenue", "ttm_op_income", "ttm_fcf",
                                         "ttm_net_income", "ttm_cfo", "ttm_capex", "ttm_pretax_income", "assets", "equity", "cash", "lt_debt", "st_debt",
@@ -128,8 +131,15 @@ for y in SNAPS:
     u = px.merge(tk, on="ticker", how="inner")
     # predecessor CIK for snapshots before the successor's first 10-K (audit F5.3)
     u["cik_listed"] = u.cik
-    lk = links[links.succ_first_10k > d][["ticker", "pred_cik"]]
+    cut = links.until.fillna(links.succ_first_10k) if "until" in links else links.succ_first_10k
+    lk = links[cut > d][["ticker", "pred_cik"]]
     u = u.merge(lk, on="ticker", how="left")
+    # use the predecessor while the successor has no balance-sheet row public by d (Alphabet filed its first 10-Q in Oct 2015 but had no cover count until 2016)
+    succ_has = set(q.loc[(q.bs_filed <= d) & (q["end"] >= d - pd.Timedelta(days=STALE_DAYS)) & q.cover_shares.notna(), "cik"])
+    late = links[(links.succ_first_10k <= d)].merge(u[["ticker", "cik"]], on="ticker")
+    late = late[~late.cik_y.isin(succ_has) if "cik_y" in late else ~late.cik.isin(succ_has)]
+    late_map = dict(zip(late.ticker, late.pred_cik))
+    u["pred_cik"] = u.pred_cik.fillna(u.ticker.map(late_map))
     u["cik"] = u.pred_cik.fillna(u.cik).astype(int)
     u["cik_source"] = np.where(u.pred_cik.notna(), "predecessor", "listed")
     u = u.drop(columns=["pred_cik"])
@@ -139,7 +149,12 @@ for y in SNAPS:
     qf = q.loc[(q.avail <= d) & (q["end"] >= d - pd.Timedelta(days=STALE_DAYS)), FLOW_COLS].dropna(subset=["ttm_revenue", "ttm_op_income", "ttm_cfo"], how="all") \
           .sort_values(["cik", "end"]).drop_duplicates("cik", keep="last").rename(columns={"end": "ttm_end"})
     fl_d = floats[(floats.cover_filed <= d) & (floats.cover_date >= d - pd.Timedelta(days=730))].sort_values(["cik", "cover_date"]).drop_duplicates("cik", keep="last")
-    u = u.merge(qs, on="cik", how="left").merge(qf, on="cik", how="left").merge(fl_d[["cik", "public_float", "float_scaled_1000"]].rename(columns={"public_float": "float_latest"}), on="cik", how="left")
+    u = u.merge(qs, on="cik", how="left").merge(qf, on="cik", how="left").merge(fl_d[["cik", "public_float", "float_scaled_1000", "cover_date"]].rename(columns={"public_float": "float_latest", "cover_date": "float_date"}), on="cik", how="left")
+    # price-scale the float to the snapshot (audit N14: a fast riser's cap legitimately exceeds a year-old float many times over)
+    px_at = me.merge(u[["ticker", "float_date"]].dropna(), on="ticker")
+    px_at = px_at[px_at.date <= px_at.float_date].sort_values("date").drop_duplicates("ticker", keep="last")[["ticker", "adj_close"]].rename(columns={"adj_close": "adj_at_float"})
+    u = u.merge(px_at, on="ticker", how="left")
+    u["float_scaled"] = u.float_latest * (u.adj_close / u.adj_at_float).where(u.adj_at_float > 0, 1.0)
     u["split_factor_after"] = u.ticker.map(later_split_factors(d)).fillna(1.0)
     u["close_unadj"] = u.close * u.split_factor_after
     # share count chain (audit F5.1/F5.2): cover count -> balance-sheet count -> diluted weighted average -> public float as a
@@ -156,7 +171,13 @@ for y in SNAPS:
     k = u.mcap.notna() & (u.mcap > CAP_MAX) & (u.mcap / 1000 > 1e7) & (u.mcap / 1000 < CAP_MAX)   # share count tagged in thousands
     u.loc[k, "mcap"] = u.loc[k, "mcap"] / 1000; u.loc[k, "shares_used"] = u.loc[k, "shares_used"] / 1000
     u.loc[k, "shares_source"] = u.loc[k, "shares_source"] + "_div1000"
-    implausible = u.mcap.notna() & ((u.mcap > CAP_MAX) | (u.float_latest.notna() & ((u.mcap > 20 * u.float_latest) | (u.mcap < u.float_latest / 20))))
+    fresh = u.float_date.notna() & (u.float_date >= d - pd.Timedelta(days=455))
+    breach = fresh & u.float_scaled.notna() & ((u.mcap > 20 * u.float_scaled) | (u.mcap < u.float_scaled / 20))
+    # a share count is overruled only when the float disagrees AND the count-based cap is absurd against the company's own size
+    ref_a = np.where(u.assets.notna(), 30 * u.assets, np.inf); ref_r = np.where(u.ttm_revenue.notna(), 100 * u.ttm_revenue, np.inf)
+    size_ref = np.where(np.isinf(ref_a) & np.isinf(ref_r), 300e9, np.maximum(np.where(np.isinf(ref_a), 0, ref_a), np.where(np.isinf(ref_r), 0, ref_r)))
+    size_bad = (u.mcap > size_ref) | (u.assets.notna() & (u.mcap < u.assets / 1000))
+    implausible = u.mcap.notna() & ((u.mcap > CAP_MAX) | (breach & size_bad))
     u.loc[implausible, "mcap"] = np.nan
     u.loc[implausible, "shares_source"] = "implausible_" + u.loc[implausible, "shares_source"]
     # float proxy scale check against the company's own size (assets, revenue)
@@ -199,7 +220,14 @@ U["liquid"] = U.dollar_vol_63d >= 1e6
 U["big_dividend"] = U.first_big_div.notna()
 U["odd_split"] = U.first_odd_split.notna()
 U["corp_action_flag"] = U.big_dividend | U.odd_split
-U["eligible"] = (U.mcap >= 300e6) & U.mcap.notna() & U.filer_active & U.liquid
+U["price_ok"] = ~U.ticker.isin(badpx)
+excl_path = Path(__file__).resolve().parent / "manual_exclusions.csv"
+U["manual_exclusion"] = False
+if excl_path.exists():
+    for r in pd.read_csv(excl_path).itertuples():
+        U.loc[(U.ticker == r.ticker) & (U.snapshot >= r.from_snapshot) & (U.snapshot <= r.to_snapshot), "manual_exclusion"] = True
+U["price_ok"] = U.price_ok & ~U.manual_exclusion
+U["eligible"] = (U.mcap >= 300e6) & U.mcap.notna() & U.filer_active & U.liquid & U.price_ok
 U["win_10x10y"] = U.eligible & (U.mult_peak_10y >= 10)
 U["win_5x5y"] = U.eligible & (U.mult_peak_5y >= 5)
 # headline sample (audit F3.3): complete windows only; incomplete snapshots are right-censored and reported separately

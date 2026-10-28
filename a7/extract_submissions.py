@@ -12,7 +12,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 KEEP = {"10-K", "10-K/A", "10-Q", "10-Q/A", "10-K405", "10-KT", "10-QT", "8-K", "8-K/A", "15", "15-12B", "15-12G", "15-15D",
-        "25", "25-NSE", "20-F", "40-F", "S-1", "424B4", "S-4", "DEFM14A", "SC 13E3", "10-12B"}
+        "25", "25-NSE", "20-F", "40-F", "S-1", "424B4", "S-4", "DEFM14A", "SC 13E3", "10-12B",
+        "SC 14D9", "SC TO-T", "SC TO-I", "SC 14D9/A", "SC TO-T/A", "PREM14A", "DEFM14C", "8-K12B", "15-12B/A"}
 z = zipfile.ZipFile(sys.argv[1])
 names = z.namelist()
 comp = {k: [] for k in ["cik", "name", "sic", "sicDescription", "entityType", "stateOfIncorporation", "fiscalYearEnd",

@@ -12,7 +12,8 @@ so `cap_source = public_float_approx`.
 
 Outcome, from the filing trail AFTER the snapshot (priority order):
   bankrupt        : 8-K item 1.03 after the snapshot                         -> -100% (A1)
-  acquired        : DEFM14A or SC 13E3 after the snapshot and within 18 months before the last 10-K/10-Q -> excluded from returns (A1)
+  acquired        : merger proxy or tender-offer filing (DEFM14A, SC 13E3, SC 14D9, SC TO-T, DEFM14C, PREM14A) within 18 months
+                    before the last 10-K/10-Q, or a final 8-K item 2.01/5.01 within 120 days of it -> excluded from returns (A1)
   spac_liquidated : SIC 6770                                                 -> trust redeemed (~0%), excluded from returns
   delisted        : Form 25 or Form 15 after the snapshot, no merger proxy   -> -100% unless a later price is found (A1)
   still_filing    : last 10-K/10-Q on/after 2025-06-01 but no exchange-listed price today
@@ -33,7 +34,8 @@ tenk = f[f.form.isin(["10-K", "10-Q", "10-K405", "10-KT", "10-QT"])]
 oc = pd.read_parquet(outcomes)
 for c in ("first_10k", "last_10kq"):
     oc[c] = pd.to_datetime(oc[c])
-q = pd.read_parquet(quarterly, columns=["cik", "end", "filed", "public_float", "assets", "ttm_revenue"])
+q = pd.read_parquet(quarterly, columns=["cik", "end", "filed", "cover_filed", "public_float", "assets", "ttm_revenue"])
+q["filed"] = q.cover_filed.where(q.cover_filed.notna(), q.filed)
 size = q[["cik", "end", "filed", "assets", "ttm_revenue"]].copy()
 q = q[q.public_float.notna() & (q.filed >= q["end"]) & (q.public_float > 1e6)]
 CAP_MAX = 3.0e12
@@ -60,6 +62,10 @@ if cik_links:   # predecessor registrants of live tickers are not dead (GOOGL 20
 bk = pd.read_parquet(filings, columns=["cik", "form", "filingDate", "items"])
 bk = bk[bk.form.str.startswith("8-K") & bk["items"].fillna("").str.contains("1.03")]
 bk["filingDate"] = pd.to_datetime(bk.filingDate)
+ctrl = pd.read_parquet(filings, columns=["cik", "form", "filingDate", "items"])
+ctrl = ctrl[ctrl.form.str.startswith("8-K") & ctrl["items"].fillna("").str.contains(r"2\.01|5\.01", regex=True)]
+ctrl["filingDate"] = pd.to_datetime(ctrl.filingDate)
+last8k_ctrl = ctrl.groupby("cik").filingDate.max().rename("last_8k_ctrl")
 f15 = f[f.form.str.startswith("15")]
 f25 = f[f.form.isin(["25", "25-NSE"])]
 
@@ -99,7 +105,12 @@ for y in range(2010, 2022):
     cand.loc[cand.last_10kq >= "2025-06-01", "outcome"] = "still_filing"
     dl = cand.form25.notna() | cand.form15.notna()
     cand.loc[dl & (cand.outcome == "stopped"), "outcome"] = "delisted"
-    acq = cand.merger_proxy.notna() & (cand.merger_proxy >= cand.last_10kq - pd.Timedelta(days=548))
+    # acquired: merger proxy or tender-offer filing within 18 months before the last report (whether filed before or after the
+    # snapshot), or a final 8-K with item 2.01 (completion of acquisition) / 5.01 (change in control) within 120 days of the last report
+    mp_any = f[f.form.isin(["DEFM14A", "SC 13E3", "SC 14D9", "SC TO-T", "DEFM14C", "PREM14A"])].groupby("cik").filingDate.max().rename("merger_any")
+    cand = cand.drop(columns=[c for c in ["merger_any", "last_8k_ctrl"] if c in cand]).merge(mp_any, on="cik", how="left").merge(last8k_ctrl, on="cik", how="left")
+    acq = (cand.merger_any.notna() & (cand.merger_any >= cand.last_10kq - pd.Timedelta(days=548)) & (cand.merger_any <= cand.last_10kq + pd.Timedelta(days=200))) | \
+          (cand.last_8k_ctrl.notna() & (cand.last_8k_ctrl >= cand.last_10kq - pd.Timedelta(days=120)) & (cand.last_8k_ctrl <= cand.last_10kq + pd.Timedelta(days=200)))
     cand.loc[acq, "outcome"] = "acquired"
     cand.loc[cand.sic.astype(str) == "6770", "outcome"] = "spac_liquidated"
     cand.loc[cand.bankruptcy_8k.notna(), "outcome"] = "bankrupt"

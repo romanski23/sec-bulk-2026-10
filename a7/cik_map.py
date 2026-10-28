@@ -75,7 +75,7 @@ if ov_path.exists():
         columns={"cik": "pred_cik", "first_10k": "pred_first_10k", "last_10kq": "pred_last_10kq", "name": "pred_name"}), on="pred_cik", how="left")
     ov = ov.merge(oc[["cik", "first_10k"]].rename(columns={"first_10k": "succ_first_10k"}), on="cik", how="left")
     ov["match_basis"] = "manual"
-    L = pd.concat([L, ov[["ticker", "cik", "pred_cik", "pred_first_10k", "pred_last_10kq", "succ_first_10k", "match_basis", "pred_name"]]], ignore_index=True)
+    L = pd.concat([L, ov[["ticker", "cik", "pred_cik", "pred_first_10k", "pred_last_10kq", "succ_first_10k", "until", "match_basis", "pred_name"]]], ignore_index=True)
 L.to_csv(out, index=False)
 print(f"candidates {len(cand)}, mapped {int(L.pred_cik.notna().sum()) if len(L) else 0}, ambiguous {int((L.match_basis.str.startswith('ambiguous')).sum()) if len(L) else 0}")
 if len(L):

@@ -1,0 +1,7 @@
+ticker,from_snapshot,to_snapshot,reason
+ONC,2016,2016,BeiGene ADS price paired with ordinary-share count (1 ADS = 13 ordinary); cap overstated 13x (audit 3)
+GOLD,2021,2021,A-Mark public float tagged 1.24e11 in consecutive filings; continuity rule cannot catch it (audit 3)
+CRIS,2011,2013,Curis Yahoo price series corrupted in these years (audit 3)
+EIG,2011,2011,share count tagged in thousands with no float to test against (audit 3)
+ENSG,2011,2011,share count tagged in thousands with no float to test against (audit 3)
+MEI,2011,2011,share count tagged in thousands with no float to test against (audit 3)
