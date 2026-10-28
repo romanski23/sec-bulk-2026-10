@@ -17,6 +17,7 @@ Env: START (default 1990-01-01), BATCH (100), MAX_TICKERS (0 = all, for test run
 """
 import csv
 import os
+import re
 import sys
 import time
 import warnings
@@ -35,6 +36,9 @@ START = os.environ.get("START", "1990-01-01")
 BATCH = int(os.environ.get("BATCH", "100"))
 MAX_TICKERS = int(os.environ.get("MAX_TICKERS", "0"))
 STOOQ_MAX = int(os.environ.get("STOOQ_MAX", "300"))
+SHARD = int(os.environ.get("SHARD", "0"))
+NSHARDS = int(os.environ.get("NSHARDS", "1"))
+UNIT_WARRANT = re.compile(r"-(UN|WT|WS|RT|U|W|R)$")  # SPAC units, warrants, rights: not common stock
 TODAY = pd.Timestamp.now(tz="America/New_York").tz_localize(None).normalize()
 COLS = ["date", "open", "high", "low", "close", "adj_close", "volume", "dividends", "stock_splits", "source"]
 
@@ -127,23 +131,27 @@ def save(frame):
 
 def main():
     tickers = [r["ticker"] for r in csv.DictReader(open(ROOT / "prices" / "tickers.csv"))]
+    skipped = [t for t in tickers if UNIT_WARRANT.search(t)]
+    tickers = [t for t in tickers if not UNIT_WARRANT.search(t)]
     if MAX_TICKERS:
         tickers = tickers[:MAX_TICKERS]
-    # SPY is the calendar and benchmark reference used by verify.py
+    # SPY is the calendar and benchmark reference used by verify.py; every shard fetches it
     if "SPY" not in tickers:
         tickers.append("SPY")
+    tickers = [t for i, t in enumerate(tickers) if i % NSHARDS == SHARD or t == "SPY"]
+    print(f"shard {SHARD}/{NSHARDS}: {len(tickers)} tickers ({len(skipped)} unit/warrant/right tickers skipped overall)", flush=True)
     log = {}
     failed = []
     t0 = time.time()
     for i in range(0, len(tickers), BATCH):
         batch = tickers[i:i + BATCH]
         res = None
-        for attempt in range(4):
+        for attempt in range(3):
             try:
                 res = yahoo_batch(batch)
                 break
             except Exception as e:  # rate limit, network
-                wait = 30 * (attempt + 1)
+                wait = 20 * (attempt + 1)
                 print(f"batch {i // BATCH} failed ({type(e).__name__}: {str(e)[:120]}), retry in {wait}s", flush=True)
                 time.sleep(wait)
         if res is None:
@@ -190,7 +198,7 @@ def main():
     for t in stooq_fail:
         log[t] = {"ticker": t, "status": "no_data", "source": "", "rows": 0, "first": "", "last": ""}
 
-    with open(DATA / "fetch_log.csv", "w", newline="") as f:
+    with open(DATA / f"fetch_log_{SHARD}.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["ticker", "status", "source", "rows", "first", "last"])
         w.writeheader()
         for t in tickers:

@@ -16,51 +16,84 @@ concurrency:
   group: prices-release
   cancel-in-progress: false
 
+env:
+  NSHARDS: "10"
+
 jobs:
-  prices:
+  fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 340
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install -q "yfinance>=1.7" pandas pyarrow duckdb numpy
-      - run: mkdir -p data
-
-      - name: Fetch Yahoo (Stooq fallback)
+      - run: pip install -q "yfinance>=1.7" pandas pyarrow
+      - name: Fetch shard from Yahoo (Stooq fallback)
         run: |
           set -o pipefail
-          python prices/fetch.py 2>&1 | tee data/fetch.log
+          mkdir -p data
+          python prices/fetch.py 2>&1 | tee data/fetch_${{ matrix.shard }}.log
         env:
+          SHARD: ${{ matrix.shard }}
           MAX_TICKERS: ${{ github.event.inputs.max_tickers || '0' }}
+      - name: Upload shard to release "prices"
+        if: always()
+        run: |
+          gh release create prices --title "Daily price history" --notes "Rebuilt by prices.yml; see verify_report.txt" 2>/dev/null || true
+          [ -d data/raw ] && tar --zstd -cf raw_${{ matrix.shard }}.tar.zst -C data raw && gh release upload prices raw_${{ matrix.shard }}.tar.zst --clobber || true
+          for f in data/fetch_${{ matrix.shard }}.log data/fetch_log_${{ matrix.shard }}.csv; do [ -f "$f" ] && gh release upload prices "$f" --clobber || true; done
+        env:
+          GH_TOKEN: ${{ github.token }}
 
+  build:
+    needs: fetch
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -q pandas pyarrow duckdb numpy
+      - name: Download shards
+        run: |
+          mkdir -p data/raw
+          for i in $(seq 0 $((NSHARDS - 1))); do
+            gh release download prices --pattern "raw_$i.tar.zst" --dir . && tar --zstd -xf raw_$i.tar.zst -C data || echo "shard $i missing"
+          done
+          gh release download prices --pattern 'fetch_log_*.csv' --dir data || true
+          python - <<'PY'
+          import glob, pandas as pd
+          fs = sorted(glob.glob('data/fetch_log_*.csv'))
+          pd.concat([pd.read_csv(f) for f in fs]).drop_duplicates('ticker').to_csv('data/fetch_log.csv', index=False)
+          print(len(fs), 'shard logs merged')
+          PY
+          ls data/raw | wc -l
+        env:
+          GH_TOKEN: ${{ github.token }}
       - name: Build prices.parquet and coverage.csv
         run: |
           set -o pipefail
           python prices/build.py 2>&1 | tee data/build.log
-      - name: Upload logs to release "prices" (reachable without the Actions UI)
-        if: always()
-        run: |
-          gh release create prices --title "Daily price history" --notes "Rebuilt by prices.yml; see verify_report.txt" 2>/dev/null || true
-          for f in data/fetch.log data/build.log data/verify_report.txt; do [ -f "$f" ] && gh release upload prices "$f" --clobber || true; done
-        env:
-          GH_TOKEN: ${{ github.token }}
-
       - name: Verify adjustment, gaps, coverage, cross-check vs sp500-data
         id: verify
         run: python prices/verify.py
         continue-on-error: true
-
       - name: Publish to release "prices"
+        if: always()
         run: |
-          gh release create prices --title "Daily price history" --notes "Rebuilt by prices.yml; see verify_report.txt" 2>/dev/null || true
-          gh release upload prices data/prices.parquet data/coverage.csv data/fetch_log.csv \
-             data/verify_report.txt data/adjustment_check.csv data/gaps_over_30d.csv data/missing_tickers.csv --clobber
-          [ -f data/crosscheck_sp500.csv ] && gh release upload prices data/crosscheck_sp500.csv --clobber || true
+          for f in data/prices.parquet data/coverage.csv data/fetch_log.csv data/build.log data/verify_report.txt \
+                   data/adjustment_check.csv data/gaps_over_30d.csv data/missing_tickers.csv data/crosscheck_sp500.csv; do
+            [ -f "$f" ] && gh release upload prices "$f" --clobber || true
+          done
         env:
           GH_TOKEN: ${{ github.token }}
-
       - name: Monthly immutable snapshot
         if: steps.verify.outcome == 'success' && (github.event.inputs.max_tickers || '0') == '0'
         run: |
@@ -70,9 +103,6 @@ jobs:
           gh release upload "$TAG" data/prices.parquet data/coverage.csv data/verify_report.txt || true
         env:
           GH_TOKEN: ${{ github.token }}
-
       - name: Fail the run if verification failed
         if: steps.verify.outcome != 'success'
-        run: |
-          echo "verify.py reported a hard failure; assets were still uploaded so the report can be read"
-          exit 1
+        run: exit 1
