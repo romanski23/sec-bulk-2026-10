@@ -109,8 +109,17 @@ def stooq(ticker):
     })
 
 
+SCHEMA = {"open": "float64", "high": "float64", "low": "float64", "close": "float64", "adj_close": "float64",
+          "volume": "float64", "dividends": "float64", "stock_splits": "float64", "source": "string", "ticker": "string"}
+
+
 def save(frame):
     t = frame["ticker"].iloc[0]
+    frame = frame[COLS + ["ticker"]].copy()
+    frame["date"] = pd.to_datetime(frame["date"]).astype("datetime64[us]")
+    for c, dt in SCHEMA.items():
+        if c in frame:
+            frame[c] = frame[c].astype(dt)
     frame[COLS].to_parquet(RAW / f"{t}.parquet", index=False)
     return {"ticker": t, "status": "ok", "source": frame["source"].iloc[0], "rows": len(frame),
             "first": frame["date"].min().date(), "last": frame["date"].max().date()}

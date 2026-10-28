@@ -26,14 +26,24 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install -q "yfinance>=1.7" pandas pyarrow duckdb numpy
+      - run: mkdir -p data
 
       - name: Fetch Yahoo (Stooq fallback)
-        run: python prices/fetch.py
+        run: |
+          set -o pipefail
+          python prices/fetch.py 2>&1 | tee data/fetch.log
         env:
           MAX_TICKERS: ${{ github.event.inputs.max_tickers || '0' }}
 
       - name: Build prices.parquet and coverage.csv
-        run: python prices/build.py
+        run: |
+          set -o pipefail
+          python prices/build.py 2>&1 | tee data/build.log
+      - name: Summary (readable through the API)
+        if: always()
+        run: |
+          { echo '## fetch'; tail -n 25 data/fetch.log 2>/dev/null; echo; echo '## build'; tail -n 40 data/build.log 2>/dev/null;
+            echo; echo '## verify'; cat data/verify_report.txt 2>/dev/null; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Verify adjustment, gaps, coverage, cross-check vs sp500-data
         id: verify
