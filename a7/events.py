@@ -18,7 +18,8 @@ import numpy as np
 import pandas as pd
 
 quarterly, prices, tickers_csv, out = sys.argv[1:5]
-q = pd.read_parquet(quarterly, columns=["cik", "end", "filed", "avail", "ttm_revenue", "ttm_op_income", "ttm_fcf", "ttm_gross_profit", "shares_out"])
+q = pd.read_parquet(quarterly, columns=["cik", "end", "filed", "avail", "ttm_revenue", "ttm_op_income", "ttm_fcf", "ttm_gross_profit", "cover_shares"])
+q = q.rename(columns={"cover_shares": "shares_out"})   # E6 on one share source only (audit F6.8)
 q = q[q.avail.notna() & (q.avail >= q["end"])].sort_values(["cik", "end"]).reset_index(drop=True)
 g = q.groupby("cik", sort=False)
 
@@ -40,10 +41,13 @@ q["E1"] = (q.ttm_op_income > 0) & prev4_neg_oi & ok4
 prev4_neg_fcf = pd.concat([lag("ttm_fcf", k) < 0 for k in (1, 2, 3, 4)], axis=1).all(axis=1)
 q["E2"] = (q.ttm_fcf > 0) & prev4_neg_fcf & ok4
 
+gap8 = (q["end"] - lag("end", 8)).dt.days
+ok8 = (gap8 >= 690) & (gap8 <= 770)
+REV_FLOOR = 10e6   # bases below US$10M make growth rates meaningless (audit F6.3)
 rev_g = q.ttm_revenue / lag("ttm_revenue", 4) - 1
 rev_g_prev = lag("ttm_revenue", 4) / lag("ttm_revenue", 8) - 1
 q["rev_growth"] = rev_g
-q["E3"] = ((rev_g - rev_g_prev) >= 0.10) & ok4 & (lag("ttm_revenue", 8) > 0)
+q["E3"] = ((rev_g - rev_g_prev) >= 0.10) & ok4 & ok8 & (q.ttm_revenue > REV_FLOOR) & (lag("ttm_revenue", 4) > REV_FLOOR) & (lag("ttm_revenue", 8) > REV_FLOOR)
 
 gm = q.ttm_gross_profit / q.ttm_revenue
 gm_yoy = gm - (lag("ttm_gross_profit", 4) / lag("ttm_revenue", 4))
@@ -79,6 +83,7 @@ me = con.execute(f"""
         FROM '{prices}') WHERE rn = 1 ORDER BY ticker, date
 """).df()
 me["date"] = pd.to_datetime(me.date)
+me = me[me.date < me.date.max().to_period("M").to_timestamp()]   # drop the partial current month (audit F6.6)
 rows = []
 for t, s in me.groupby("ticker"):
     v = s.adj_close.values; d = s.date.values
@@ -92,9 +97,10 @@ for t, s in me.groupby("ticker"):
             if i - last_high >= 12:
                 rows.append((t, d[i]))
             last_high = i
-E7 = pd.DataFrame(rows, columns=["ticker", "event_date"]).merge(tk, on="ticker", how="left")
+E7 = pd.DataFrame(rows, columns=["ticker", "event_date"]).merge(tk, on="ticker", how="inner")   # primary tickers only (audit F3.1)
 E7["event"] = "E7"; E7["quarter_end"] = pd.NaT
 E7["event_date"] = pd.to_datetime(E7.event_date)
 F = pd.concat([F, E7[["cik", "quarter_end", "event_date", "event", "ticker"]]], ignore_index=True)
+F["cik"] = F.cik.astype("Int64")
 F.to_parquet(out, index=False)
 print(F.groupby("event").agg(n=("cik", "size"), companies=("cik", "nunique")).to_string())

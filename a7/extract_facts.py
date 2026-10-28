@@ -31,6 +31,10 @@ TAGS = {
         "PaymentsForRepurchaseOfCommonStock", "PaymentsOfDividends", "PaymentsOfDividendsCommonStock",
         "CommonStockDividendsPerShareDeclared", "CommonStockDividendsPerShareCashPaid",
         "ProceedsFromIssuanceOfCommonStock",
+        "RevenuesNetOfInterestExpense", "InterestAndDividendIncomeOperating", "NoninterestIncome", "InterestIncomeExpenseNet",
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
+        "PremiumsEarnedNet", "OperatingExpenses", "CostsAndExpenses",
     ],
     "dei": ["EntityCommonStockSharesOutstanding", "EntityPublicFloat"],
 }

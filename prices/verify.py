@@ -152,6 +152,9 @@ try:
     cmp.to_csv(DATA / "crosscheck_sp500.csv", index=False)
     if tot_days and tot_bad / tot_days > 0.01:
         hard_fail.append("cross-check: >1% of member-days disagree with sp500-data")
+    bad_cum = cmp[cmp.wealth_ratio_diff.abs() > 0.02]
+    if os.environ.get("CUM_FAIL") == "1" and len(bad_cum):
+        hard_fail.append(f"cross-check: {len(bad_cum)} tickers differ by >2% in cumulative wealth ({', '.join(bad_cum.ticker.head(10))})")
 except Exception as e:
     say(f"    [SKIP] cross-check unavailable: {type(e).__name__}: {str(e)[:150]}")
 

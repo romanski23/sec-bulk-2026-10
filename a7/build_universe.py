@@ -26,7 +26,9 @@ import numpy as np
 import pandas as pd
 
 prices, quarterly, outcomes, tickers_csv, out = sys.argv[1:6]
+cik_links = sys.argv[6] if len(sys.argv) > 6 else None
 out = Path(out); out.mkdir(parents=True, exist_ok=True)
+STALE_DAYS = 455      # fundamentals older than 15 months before the snapshot are treated as missing (audit F6.2)
 con = duckdb.connect()
 con.execute(f"CREATE VIEW p AS SELECT * FROM '{prices}'")
 cal = con.execute("SELECT date FROM p WHERE ticker='SPY' ORDER BY date").df()["date"]
@@ -42,7 +44,11 @@ me = con.execute("""
         FROM p) WHERE rn = 1
 """).df()
 me["date"] = pd.to_datetime(me["date"])
+me = me[me.date < LAST_DATE.to_period("M").to_timestamp()]   # drop the partial current month (audit F6.6)
 me = me.sort_values(["ticker", "date"])
+# corrected-price flags (prices/correct.py): adj_source per ticker and spin_uncertain
+pflags = con.execute("SELECT ticker, ANY_VALUE(adj_source) AS adj_source, BOOL_OR(spin_uncertain) AS spin_uncertain FROM p GROUP BY ticker").df() \
+    if "adj_source" in [c[0] for c in con.execute("DESCRIBE p").fetchall()] else None
 # cumulative later split factor: product of stock_splits (>0) strictly after date
 splits = con.execute("SELECT ticker, date, stock_splits FROM p WHERE stock_splits > 0 ORDER BY ticker, date").df()
 splits["date"] = pd.to_datetime(splits["date"])
@@ -76,12 +82,19 @@ if "is_primary" in tk:
     tk = tk[tk.is_primary]
 tk = tk[["ticker", "cik", "exchange", "name", "sic"]]
 tk["cik"] = tk["cik"].astype(int)
-q = pd.read_parquet(quarterly, columns=["cik", "end", "filed", "avail", "shares_out", "ttm_revenue", "ttm_op_income", "ttm_fcf",
-                                        "ttm_net_income", "ttm_cfo", "ttm_capex", "assets", "equity", "cash", "lt_debt", "st_debt",
-                                        "q_cfo", "q_capex", "ttm_sbc", "ttm_rnd", "ttm_gross_profit", "q_diluted_shares"])
+links = pd.read_csv(cik_links) if cik_links else pd.DataFrame(columns=["ticker", "pred_cik", "succ_first_10k"])
+links = links[links.pred_cik.notna()]
+links["pred_cik"] = links.pred_cik.astype(int)
+links["succ_first_10k"] = pd.to_datetime(links.succ_first_10k)
+q = pd.read_parquet(quarterly, columns=["cik", "end", "filed", "bs_filed", "avail", "shares_out", "cover_shares", "public_float", "cover_date", "cover_filed",
+                                        "ttm_revenue", "ttm_op_income", "ttm_fcf",
+                                        "ttm_net_income", "ttm_cfo", "ttm_capex", "ttm_pretax_income", "assets", "equity", "cash", "lt_debt", "st_debt",
+                                        "q_cfo", "q_capex", "ttm_sbc", "ttm_rnd", "ttm_gross_profit", "q_diluted_shares", "q_revenue_src", "q_op_income_src"])
+floats = q.loc[q.public_float.notna() & q.cover_filed.notna() & (q.public_float > 0), ["cik", "cover_date", "cover_filed", "public_float"]].drop_duplicates()
 q = q[q.filed.notna() & (q.filed >= q["end"])]
-STOCK_COLS = ["cik", "end", "filed", "shares_out", "assets", "equity", "cash", "lt_debt", "st_debt", "q_diluted_shares", "q_cfo", "q_capex"]
-FLOW_COLS = ["cik", "end", "avail", "ttm_revenue", "ttm_op_income", "ttm_fcf", "ttm_net_income", "ttm_cfo", "ttm_capex", "ttm_sbc", "ttm_rnd", "ttm_gross_profit"]
+q["bs_filed"] = q.bs_filed.where(q.bs_filed.notna(), q.filed)
+STOCK_COLS = ["cik", "end", "bs_filed", "shares_out", "cover_shares", "public_float", "assets", "equity", "cash", "lt_debt", "st_debt", "q_diluted_shares", "q_cfo", "q_capex"]
+FLOW_COLS = ["cik", "end", "avail", "ttm_revenue", "ttm_op_income", "ttm_fcf", "ttm_net_income", "ttm_cfo", "ttm_capex", "ttm_pretax_income", "ttm_sbc", "ttm_rnd", "ttm_gross_profit", "q_revenue_src", "q_op_income_src"]
 oc = pd.read_parquet(outcomes)
 
 
@@ -95,16 +108,31 @@ for y in SNAPS:
     d = snap_dates[y]
     px = me[me.date == d][["ticker", "adj_close", "close"]]
     u = px.merge(tk, on="ticker", how="inner")
-    # latest fundamentals public by d
-    qs = q.loc[q.filed <= d, STOCK_COLS].sort_values(["cik", "end"]).drop_duplicates("cik", keep="last").rename(columns={"end": "bs_end"})
-    qf = q.loc[q.avail <= d, FLOW_COLS].dropna(subset=["ttm_revenue", "ttm_op_income", "ttm_cfo"], how="all") \
+    # predecessor CIK for snapshots before the successor's first 10-K (audit F5.3)
+    u["cik_listed"] = u.cik
+    lk = links[links.succ_first_10k > d][["ticker", "pred_cik"]]
+    u = u.merge(lk, on="ticker", how="left")
+    u["cik"] = u.pred_cik.fillna(u.cik).astype(int)
+    u["cik_source"] = np.where(u.pred_cik.notna(), "predecessor", "listed")
+    u = u.drop(columns=["pred_cik"])
+    # latest fundamentals public by d, not older than STALE_DAYS (audit F6.2)
+    qs = q.loc[(q.bs_filed <= d) & (q["end"] >= d - pd.Timedelta(days=STALE_DAYS)), STOCK_COLS] \
+          .sort_values(["cik", "end"]).drop_duplicates("cik", keep="last").rename(columns={"end": "bs_end"})
+    qf = q.loc[(q.avail <= d) & (q["end"] >= d - pd.Timedelta(days=STALE_DAYS)), FLOW_COLS].dropna(subset=["ttm_revenue", "ttm_op_income", "ttm_cfo"], how="all") \
           .sort_values(["cik", "end"]).drop_duplicates("cik", keep="last").rename(columns={"end": "ttm_end"})
-    u = u.merge(qs, on="cik", how="left").merge(qf, on="cik", how="left")
+    fl_d = floats[(floats.cover_filed <= d) & (floats.cover_date >= d - pd.Timedelta(days=730))].sort_values(["cik", "cover_date"]).drop_duplicates("cik", keep="last")
+    u = u.merge(qs, on="cik", how="left").merge(qf, on="cik", how="left").merge(fl_d[["cik", "public_float"]].rename(columns={"public_float": "float_latest"}), on="cik", how="left")
     u["split_factor_after"] = u.ticker.map(later_split_factors(d)).fillna(1.0)
     u["close_unadj"] = u.close * u.split_factor_after
-    u["shares_used"] = u.shares_out.where(u.shares_out.notna(), u.q_diluted_shares)
-    u["shares_source"] = np.where(u.shares_out.notna(), "cover", np.where(u.q_diluted_shares.notna(), "diluted_wavg", "none"))
+    # share count chain (audit F5.1/F5.2): cover count -> balance-sheet count -> diluted weighted average -> public float as a
+    # cap proxy for multi-class issuers whose total is not in companyfacts (labelled approximate)
+    bs_shares = u.shares_out.where(u.cover_shares.isna(), np.nan)
+    u["shares_used"] = u.cover_shares.where(u.cover_shares.notna(), bs_shares.where(bs_shares.notna(), u.q_diluted_shares))
+    u["shares_source"] = np.where(u.cover_shares.notna(), "cover", np.where(bs_shares.notna(), "balance_sheet",
+                         np.where(u.q_diluted_shares.notna(), "diluted_wavg", np.where(u.float_latest.notna(), "public_float_approx", "none"))))
     u["mcap"] = u.close_unadj * u.shares_used
+    u["mcap"] = u.mcap.where(u.mcap.notna(), u.float_latest)
+    u["mcap_approx"] = u.shares_source == "public_float_approx"
     u["snapshot"] = y
     u["snap_date"] = d
     u = u.merge(liq[liq.snap == d][["ticker", "dollar_vol_63d"]], on="ticker", how="left")
@@ -124,6 +152,10 @@ U = pd.concat(rows, ignore_index=True)
 U = U.merge(lastpx, on="ticker", how="left")
 U = U.merge(oc[["cik", "first_10k", "last_10kq", "form15", "form25", "bankruptcy_8k"]], on="cik", how="left")
 U = U.merge(bigdiv, on="ticker", how="left").merge(oddsplit, on="ticker", how="left")
+if pflags is not None:
+    U = U.merge(pflags, on="ticker", how="left")
+else:
+    U["adj_source"] = "yahoo"; U["spin_uncertain"] = U.first_odd_split.notna()
 U["first_10k"] = pd.to_datetime(U.first_10k); U["last_10kq"] = pd.to_datetime(U.last_10kq)
 U["filer_active"] = (U.first_10k <= U.snap_date) & (U.last_10kq >= U.snap_date - pd.Timedelta(days=400))
 U["liquid"] = U.dollar_vol_63d >= 1e6
@@ -133,6 +165,15 @@ U["corp_action_flag"] = U.big_dividend | U.odd_split
 U["eligible"] = (U.mcap >= 300e6) & U.mcap.notna() & U.filer_active & U.liquid
 U["win_10x10y"] = U.eligible & (U.mult_peak_10y >= 10)
 U["win_5x5y"] = U.eligible & (U.mult_peak_5y >= 5)
+# headline sample (audit F3.3): complete windows only; incomplete snapshots are right-censored and reported separately
+U["headline_10y"] = U.eligible & U.window_complete_10y
+U["headline_5y"] = U.eligible & U.window_complete_5y
+# flags inside the forward window (corporate actions that could distort the outcome), reported with and without
+U["flag_in_window_10y"] = ((U.first_big_div > U.snap_date) & (U.first_big_div <= U.snap_date + pd.DateOffset(years=10))) | \
+                          ((U.first_odd_split > U.snap_date) & (U.first_odd_split <= U.snap_date + pd.DateOffset(years=10)))
+U["flag_in_window_5y"] = ((U.first_big_div > U.snap_date) & (U.first_big_div <= U.snap_date + pd.DateOffset(years=5))) | \
+                         ((U.first_odd_split > U.snap_date) & (U.first_odd_split <= U.snap_date + pd.DateOffset(years=5)))
+U["outcome_uncertain"] = (U.adj_source != "reference") & (U.flag_in_window_10y | U.flag_in_window_5y)
 U["dead"] = (U.last_date < LAST_DATE - pd.Timedelta(days=10))
 U.to_parquet(out / "universe.parquet", index=False)
 
@@ -146,11 +187,13 @@ W = pd.concat(w, ignore_index=True)
 W.to_parquet(out / "winners.parquet", index=False)
 
 # summary
-print("snapshot  priced  cap>=300M  eligible(+active,liquid)  no_shares  win10x10y  win5x5y  10y_complete")
+print("snapshot  priced  cap>=300M  eligible  no_shares  float_approx  pred_cik  win10x10y  win5x5y  10y_complete")
 for y in SNAPS:
     s = U[U.snapshot == y]
-    print(f"{y}  {len(s):6d}  {int((s.mcap >= 300e6).sum()):6d}  {int(s.eligible.sum()):6d}  {int((s.shares_source == "none").sum()):6d}  "
+    print(f"{y}  {len(s):6d}  {int((s.mcap >= 300e6).sum()):6d}  {int(s.eligible.sum()):6d}  {int((s.shares_source == 'none').sum()):6d}  "
+          f"{int((s.eligible & s.mcap_approx).sum()):6d}  {int((s.eligible & (s.cik_source == 'predecessor')).sum()):5d}  "
           f"{int(s.win_10x10y.sum()):5d}  {int(s.win_5x5y.sum()):5d}  {bool(s.window_complete_10y.iloc[0]) if len(s) else None}")
-print("unique winners:", W.groupby("tag").ticker.nunique().to_dict())
-print("of which big_dividend-flagged:", W[W.big_dividend].groupby("tag").ticker.nunique().to_dict(),
-      " odd_split-flagged:", W[W.odd_split].groupby("tag").ticker.nunique().to_dict())
+print("unique winners:", W.groupby("tag").ticker.nunique().to_dict(),
+      " headline (complete windows):", {t: int(W[(W.tag == t) & W["window_complete_10y" if t == "win_10x10y" else "window_complete_5y"]].ticker.nunique()) for t in W.tag.unique()})
+print("outcome_uncertain (no reference series and a corporate-action flag inside the window):", W[W.outcome_uncertain].groupby("tag").ticker.nunique().to_dict(),
+      " adj_source:", W.adj_source.value_counts().to_dict())

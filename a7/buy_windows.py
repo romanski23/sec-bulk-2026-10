@@ -11,6 +11,8 @@ a signal. Outputs:
                          gain, peak_mult, too_early_before (months), dd_before
   winner_shapes.parquet: ticker, setting, n_runs, first_run_start,
                          longest_too_early, shape (sharp / steady / unknown)
+  too_early_months.parquet (headline setting): per too-early month, months to the
+                         next run start, annualised return to it, drawdown on the way
 """
 import sys
 from pathlib import Path
@@ -34,13 +36,14 @@ me = con.execute(f"""
     WHERE rn = 1 ORDER BY ticker, date
 """, [tickers]).df()
 me["date"] = pd.to_datetime(me.date)
+me = me[me.date < me.date.max().to_period("M").to_timestamp()]   # drop the partial current month (audit F6.6)
 
 
 def ann(mult, months):
     return mult ** (12.0 / months) - 1.0
 
 
-label_rows, run_rows, shape_rows = [], [], []
+label_rows, run_rows, shape_rows, early_rows = [], [], [], []
 for t, g in me.groupby("ticker", sort=False):
     v = g.adj_close.values.astype(float); d = g.date.values; n = len(v)
     if n < 25:
@@ -86,7 +89,17 @@ for t, g in me.groupby("ticker", sort=False):
                 before = lab[prev_end + 1:s]
                 early = int((before == "too_early").sum())
                 longest_early = max(longest_early, early)
-                dd_before = v[prev_end + 1:s + 1].min() / v[prev_end + 1] - 1.0 if s > prev_end + 1 else 0.0
+                # peak-to-trough drawdown between the previous run and this one (audit F6.5)
+                seg = v[prev_end + 1:s + 1]
+                dd_before = float((seg / np.maximum.accumulate(seg) - 1.0).min()) if len(seg) > 1 else 0.0
+                # per too-early month: annualised return to this run's start and max drawdown on the way (A5 cost of being early)
+                if key == HEADLINE:
+                    for i in range(prev_end + 1, s):
+                        if lab[i] == "too_early":
+                            months = s - i
+                            path = v[i:s + 1]
+                            early_rows.append(dict(ticker=t, month=d[i], next_run_no=k, months_to_run=months,
+                                                   ann_to_run=ann(v[s] / v[i], months), dd_to_run=float((path / np.maximum.accumulate(path) - 1.0).min())))
                 run_end_i = min(e + 36, n - 1)  # the run's gain is measured 36m past its last buy month (what the last buyer earned)
                 run_rows.append(dict(ticker=t, setting=key, run_no=k, start=d[s], end=d[e], buy_months=int(buy[s:e + 1].sum()),
                                      gain=v[run_end_i] / v[s] - 1.0, peak_mult=v[s:run_end_i + 1].max() / v[s],
@@ -108,6 +121,7 @@ L = pd.concat(label_rows, ignore_index=True)
 R = pd.DataFrame(run_rows)
 S = pd.DataFrame(shape_rows)
 L.to_parquet(out / "month_labels.parquet", index=False)
+pd.DataFrame(early_rows).to_parquet(out / "too_early_months.parquet", index=False)
 R.to_parquet(out / "runs.parquet", index=False)
 S.to_parquet(out / "winner_shapes.parquet", index=False)
 

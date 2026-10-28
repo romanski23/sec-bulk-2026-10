@@ -1,5 +1,5 @@
 """A7 step 4b: rule-based matched controls (design note §4, pre-registration §1).
-Usage: python -I match_controls.py universe.parquet winners.parquet out_dir
+Usage: python -I match_controls.py universe.parquet winners.parquet out_dir [quarterly.parquet]
 
 For each winner at its first qualifying snapshot, 3 controls from the SAME
 snapshot that are eligible, not winners under the same tag at any snapshot,
@@ -24,22 +24,38 @@ import numpy as np
 import pandas as pd
 
 universe, winners, out = sys.argv[1:4]
+quarterly = sys.argv[4] if len(sys.argv) > 4 else None
 out = Path(out); out.mkdir(parents=True, exist_ok=True)
 U = pd.read_parquet(universe)
 W = pd.read_parquet(winners)
 U = U[U.eligible].copy()
+# trailing growth and share change from the quarterly table itself (audit F3.2): the TTM public at the snapshot versus the
+# TTM row four quarters earlier, both > 0; independent of the company's eligibility a year earlier
+if quarterly:
+    q = pd.read_parquet(quarterly, columns=["cik", "end", "ttm_revenue", "cover_shares", "q_diluted_shares"])
+    q = q.sort_values(["cik", "end"])
+    g = q.groupby("cik", sort=False)
+    gap = (q["end"] - g["end"].shift(4)).dt.days
+    ok = gap.between(330, 400)
+    q["rev_prev_q"] = g.ttm_revenue.shift(4).where(ok)
+    sh = q.cover_shares.where(q.cover_shares.notna(), q.q_diluted_shares)
+    q["sh_src"] = np.where(q.cover_shares.notna(), "cover", "diluted")
+    q["sh_now"] = sh; q["sh_prev"] = sh.groupby(q.cik).shift(4).where(ok)
+    q["sh_src_prev"] = q.sh_src.groupby(q.cik).shift(4)
+    q = q[["cik", "end", "rev_prev_q", "sh_now", "sh_prev", "sh_src", "sh_src_prev"]].rename(columns={"end": "ttm_end"})
+    U = U.merge(q, on=["cik", "ttm_end"], how="left")
 U["sic2"] = U.sic.astype("string").str.zfill(4).str[:2]
 U["sic1"] = U.sic2.str[:1]
 U["logcap"] = np.log(U.mcap)
 U["cap_decile"] = U.groupby("snapshot").logcap.transform(lambda s: pd.qcut(s.rank(method="first"), 10, labels=False))
 U["cfo_sign"] = np.sign(U.ttm_cfo.fillna(U.q_cfo))
 U["inv_sign"] = -np.sign(U.ttm_capex.fillna(U.q_capex).fillna(0))
-prev = U[["ticker", "snapshot", "shares_used", "ttm_revenue"]].assign(snapshot=lambda d: d.snapshot + 1) \
-        .rename(columns={"shares_used": "shares_prev", "ttm_revenue": "rev_prev"})
-U = U.merge(prev, on=["ticker", "snapshot"], how="left")
-U["fin_sign"] = np.sign((U.shares_used / U.shares_prev - 1).fillna(0).round(3))
+if "rev_prev_q" not in U:
+    U["rev_prev_q"] = np.nan; U["sh_now"] = np.nan; U["sh_prev"] = np.nan; U["sh_src"] = None; U["sh_src_prev"] = None
+same_src = U.sh_src == U.sh_src_prev
+U["fin_sign"] = np.sign((U.sh_now / U.sh_prev - 1).where(same_src).fillna(0).round(3))
 U["dickinson"] = U.cfo_sign.astype("Int64").astype(str) + U.inv_sign.astype("Int64").astype(str) + U.fin_sign.astype("Int64").astype(str)
-U["rev_growth"] = U.ttm_revenue / U.rev_prev - 1
+U["rev_growth"] = np.where((U.ttm_revenue > 0) & (U.rev_prev_q > 0), U.ttm_revenue / U.rev_prev_q - 1, np.nan)
 U["growth_q"] = U.groupby("snapshot").rev_growth.transform(
     lambda s: pd.qcut(s.rank(method="first"), 5, labels=False) if s.notna().sum() >= 5 else np.nan)
 
@@ -92,4 +108,6 @@ U.to_parquet(out / "universe_features.parquet", index=False)
 print("winners:", W.groupby("tag").ticker.nunique().to_dict())
 print("controls per tag:", C.groupby("tag").size().to_dict())
 print("winners with <3 controls:", (C.groupby(["tag", "winner"]).size() < 3).sum())
+wv = U.merge(W[["ticker", "snapshot", "tag"]], on=["ticker", "snapshot"])
+print("winners with a growth quintile:", f"{wv.growth_q.notna().mean():.0%}", " eligible rows with one:", f"{U.growth_q.notna().mean():.0%}")
 print(C.match_level.value_counts().head(8).to_string())

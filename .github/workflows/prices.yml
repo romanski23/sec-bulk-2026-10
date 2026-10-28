@@ -81,14 +81,22 @@ jobs:
         run: |
           set -o pipefail
           python prices/build.py 2>&1 | tee data/build.log
-      - name: Verify adjustment, gaps, coverage, cross-check vs sp500-data
+      - name: Verify raw Yahoo series (adjustment, gaps, coverage, cross-check vs sp500-data)
+        run: python prices/verify.py || true
+      - name: Correct spin-off adjustments (reference splice, double-count undo)
+        run: python prices/correct.py data/prices.parquet data/sp500_prices.parquet data/prices_corrected.parquet data/corrections.csv
+      - name: Verify corrected series (cumulative wealth must match the reference)
         id: verify
-        run: python prices/verify.py
+        run: |
+          cp data/verify_report.txt data/verify_report_raw.txt
+          cp data/prices.parquet data/prices_raw.parquet && cp data/prices_corrected.parquet data/prices.parquet
+          CUM_FAIL=1 python prices/verify.py
+          mv data/prices_raw.parquet data/prices.parquet
         continue-on-error: true
       - name: Publish to release "prices"
         if: always()
         run: |
-          for f in data/prices.parquet data/coverage.csv data/fetch_log.csv data/build.log data/verify_report.txt \
+          for f in data/prices.parquet data/prices_corrected.parquet data/corrections.csv data/coverage.csv data/fetch_log.csv data/build.log data/verify_report.txt data/verify_report_raw.txt \
                    data/adjustment_check.csv data/gaps_over_30d.csv data/missing_tickers.csv data/crosscheck_sp500.csv; do
             [ -f "$f" ] && gh release upload prices "$f" --clobber || true
           done
@@ -100,7 +108,7 @@ jobs:
           TAG="prices-$(date -u +%Y-%m)"
           gh release view "$TAG" >/dev/null 2>&1 && exit 0
           gh release create "$TAG" --title "Prices snapshot $(date -u +%Y-%m)" --notes "Immutable copy, never overwritten." || true
-          gh release upload "$TAG" data/prices.parquet data/coverage.csv data/verify_report.txt || true
+          gh release upload "$TAG" data/prices.parquet data/prices_corrected.parquet data/corrections.csv data/coverage.csv data/verify_report.txt || true
         env:
           GH_TOKEN: ${{ github.token }}
       - name: Fail the run if verification failed
