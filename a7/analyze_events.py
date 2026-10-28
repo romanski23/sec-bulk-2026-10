@@ -129,6 +129,16 @@ def near(row):
     return ((g.event_date >= row.start - pd.DateOffset(months=6)) & (g.event_date <= row.start + pd.DateOffset(months=6))).any()
 Rh = Rh.assign(near_event=Rh.apply(near, axis=1))
 say(f"- EF6a: run starts with at least one of E1-E5 within +/-2 quarters: {pct(Rh.near_event.mean())} of {len(Rh)} runs (first runs only: {pct(Rh[Rh.run_no == 1].near_event.mean())}, n={int((Rh.run_no == 1).sum())}). Pre-registered expectation: most.")
+late = Rh[Rh.start >= "2012-06-30"]
+say(f"- EF6a (sensitivity, run starts from July 2012 when XBRL covers all filers): {pct(late.near_event.mean())} of {len(late)} runs; first runs starting then or later: {pct(late[late.run_no == 1].near_event.mean())} (n={int((late.run_no == 1).sum())}); any run that is the first after July 2012 per winner: {pct(late.sort_values(['ticker', 'start']).drop_duplicates('ticker').near_event.mean())} (n={late.ticker.nunique()}).")
+# which fundamental event is nearest to run starts, and how far
+def nearest_gap(row):
+    g = E15[E15.ticker == row.ticker]
+    if g.empty:
+        return np.nan
+    return ((g.event_date - row.start).dt.days / 30.4).abs().min()
+late = late.assign(gap=late.apply(nearest_gap, axis=1))
+say(f"- Distance from a run start (from July 2012) to the nearest E1-E5 firing, either side: median {late.gap.median():.0f} months, IQR {late.gap.quantile(.25):.0f}-{late.gap.quantile(.75):.0f}; no fundamental event at all in the data: {pct(late.gap.isna().mean())}.")
 say(f"- EF6b: winners with a too-early stretch of 12+ months before the first run: {pct((first_runs.too_early_before >= 12).mean())} of {len(first_runs)}. Expectation: more than a third.")
 say(f"- EF7a: median buy months per run: {Rh.buy_months.median():.0f} (first runs: {first_runs.buy_months.median():.0f}). Expectation: more than 24.")
 say(f"- EF9: shape split: sharp {int((Sh['shape'] == 'sharp').sum())}, steady {int((Sh['shape'] == 'steady').sum())}, unknown {int((Sh['shape'] == 'unknown').sum())}.")
