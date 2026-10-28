@@ -39,11 +39,15 @@ jobs:
         run: |
           python -I a7/build_universe.py in/prices.parquet out/quarterly.parquet out/outcomes.parquet a7/tickers_primary.csv out/a7 | tee out/a7_universe.log
           python -I a7/match_controls.py out/a7/universe.parquet out/a7/winners.parquet out/a7 | tee out/a7_controls.log
+          python -I a7/build_dead.py out/filings.parquet out/outcomes.parquet out/quarterly.parquet out/a7/universe.parquet out/a7/dead_universe.parquet | tee out/a7_dead.log
+          python -I a7/run_starts.py in/prices.parquet out/a7/winners.parquet out/a7/run_starts.parquet | tee out/a7_run_starts.log
+          python -I a7/events.py out/quarterly.parquet in/prices.parquet a7/tickers_primary.csv out/a7/events.parquet | tee out/a7_events.log
       - name: Publish to release "derived"
         run: |
           gh release create derived --title "Derived tables (SEC + A7 step 4)" --notes "Rebuilt by derived.yml from the v1 SEC zips and the prices release. Scripts in a7/." 2>/dev/null || true
           gh release upload derived out/facts.parquet out/companies.parquet out/filings.parquet out/quarterly.parquet out/outcomes.parquet \
             out/a7/universe.parquet out/a7/winners.parquet out/a7/controls.parquet out/a7/universe_features.parquet \
-            out/a7_universe.log out/a7_controls.log --clobber
+            out/a7/dead_universe.parquet out/a7/run_starts.parquet out/a7/events.parquet \
+            out/a7_universe.log out/a7_controls.log out/a7_dead.log out/a7_run_starts.log out/a7_events.log --clobber
         env:
           GH_TOKEN: ${{ github.token }}
