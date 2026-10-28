@@ -91,7 +91,7 @@ adj.to_csv(DATA / "adjustment_check.csv", index=False)
 
 # [2] gaps -------------------------------------------------------------------
 say("\n[2] GAPS (missing trading days inside each ticker's own span, vs SPY calendar)")
-cov = pd.read_csv(DATA / "coverage.csv", parse_dates=["first", "last"])
+cov = pd.read_csv(DATA / "coverage.csv", parse_dates=["first_date", "last_date"])
 cov["missing_pct"] = cov.missing_days / cov.expected_days.replace(0, np.nan) * 100
 say(f"    tickers with zero missing days: {(cov.missing_days == 0).sum():,} of {len(cov):,}")
 say(f"    missing >1% of span: {(cov.missing_pct > 1).sum():,}; >5%: {(cov.missing_pct > 5).sum():,}")
@@ -113,9 +113,9 @@ missing = want[~want.ticker.isin(have)]
 say(f"    tickers.csv: {len(want):,}; with price data: {want.ticker.isin(have).sum():,}; none: {len(missing):,}")
 say(f"    missing by exchange: {missing.exchange.value_counts().to_dict()}")
 for y in (2010, 2012, 2016, 2021):
-    k = (cov["first"] <= f"{y}-12-31").sum()
+    k = (cov["first_date"] <= f"{y}-12-31").sum()
     say(f"    history reaching back to {y}-12-31 or earlier: {k:,} tickers")
-say(f"    last date is the dataset max for {(cov['last'] == cov['last'].max()).sum():,} tickers "
+say(f"    last date is the dataset max for {(cov['last_date'] == cov['last_date'].max()).sum():,} tickers "
     f"(others ended earlier = delisted while in Yahoo, or stale)")
 missing.to_csv(DATA / "missing_tickers.csv", index=False)
 

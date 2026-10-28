@@ -23,17 +23,17 @@ con.execute("CREATE TABLE cal AS SELECT date FROM p WHERE ticker = 'SPY'")
 con.execute(f"""
     COPY (
         WITH span AS (
-            SELECT ticker, MIN(date) first, MAX(date) last, COUNT(*) rows, ANY_VALUE(source) source,
-                   SUM(CASE WHEN dividends > 0 THEN 1 ELSE 0 END) dividend_days,
-                   SUM(CASE WHEN stock_splits > 0 THEN 1 ELSE 0 END) split_days
+            SELECT ticker, MIN(date) AS first_date, MAX(date) AS last_date, COUNT(*) AS nrows, ANY_VALUE(source) AS source,
+                   SUM(CASE WHEN dividends > 0 THEN 1 ELSE 0 END) AS dividend_days,
+                   SUM(CASE WHEN stock_splits > 0 THEN 1 ELSE 0 END) AS split_days
             FROM p GROUP BY ticker
         ),
         expected AS (
-            SELECT s.ticker, COUNT(c.date) expected_days
-            FROM span s JOIN cal c ON c.date BETWEEN s.first AND s.last
+            SELECT s.ticker, COUNT(c.date) AS expected_days
+            FROM span s JOIN cal c ON c.date BETWEEN s.first_date AND s.last_date
             GROUP BY s.ticker
         )
-        SELECT s.*, e.expected_days, e.expected_days - s.rows AS missing_days
+        SELECT s.*, e.expected_days, e.expected_days - s.nrows AS missing_days
         FROM span s LEFT JOIN expected e USING (ticker)
         ORDER BY ticker
     ) TO '{DATA}/coverage.csv' (HEADER)
