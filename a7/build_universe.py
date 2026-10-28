@@ -58,6 +58,15 @@ liq["snap"] = pd.to_datetime(liq["snap"])
 # special dividends / spin-offs booked as dividends: any single dividend above 25% of that day's close
 bigdiv = con.execute("SELECT ticker, MIN(date) AS first_big_div, MAX(dividends / close) AS max_div_ratio FROM p WHERE close > 0 AND dividends / close > 0.25 GROUP BY ticker").df()
 bigdiv["first_big_div"] = pd.to_datetime(bigdiv["first_big_div"])
+# spin-offs booked by Yahoo as split factors (e.g. DELL 1.973 for VMware, GE 1.253 for the 2023 spin). Ordinary splits,
+# reverse splits and stock dividends are simple ratios (n/m with n, m <= 10; integers and 1/integers to 100; within 2% of 1); anything else is flagged.
+allsplits = con.execute("SELECT ticker, date, stock_splits FROM p WHERE stock_splits > 0").df()
+simple = sorted({n / m for n in range(1, 11) for m in range(1, 11)} | {n for n in range(1, 101)} | {1 / n for n in range(1, 101)})
+def is_simple(f):
+    return abs(f - 1) < 0.02 or any(abs(f / r - 1) < 0.001 for r in simple)
+allsplits["odd"] = ~allsplits.stock_splits.map(is_simple)
+oddsplit = allsplits[allsplits.odd].groupby("ticker").agg(first_odd_split=("date", "min"), n_odd_splits=("date", "size")).reset_index()
+oddsplit["first_odd_split"] = pd.to_datetime(oddsplit["first_odd_split"])
 # last price per ticker
 lastpx = con.execute("SELECT ticker, MAX(date) last_date, MIN(date) first_date FROM p GROUP BY ticker").df()
 lastpx["last_date"] = pd.to_datetime(lastpx["last_date"]); lastpx["first_date"] = pd.to_datetime(lastpx["first_date"])
@@ -114,11 +123,13 @@ for y in SNAPS:
 U = pd.concat(rows, ignore_index=True)
 U = U.merge(lastpx, on="ticker", how="left")
 U = U.merge(oc[["cik", "first_10k", "last_10kq", "form15", "form25", "bankruptcy_8k"]], on="cik", how="left")
-U = U.merge(bigdiv, on="ticker", how="left")
+U = U.merge(bigdiv, on="ticker", how="left").merge(oddsplit, on="ticker", how="left")
 U["first_10k"] = pd.to_datetime(U.first_10k); U["last_10kq"] = pd.to_datetime(U.last_10kq)
 U["filer_active"] = (U.first_10k <= U.snap_date) & (U.last_10kq >= U.snap_date - pd.Timedelta(days=400))
 U["liquid"] = U.dollar_vol_63d >= 1e6
 U["big_dividend"] = U.first_big_div.notna()
+U["odd_split"] = U.first_odd_split.notna()
+U["corp_action_flag"] = U.big_dividend | U.odd_split
 U["eligible"] = (U.mcap >= 300e6) & U.mcap.notna() & U.filer_active & U.liquid
 U["win_10x10y"] = U.eligible & (U.mult_peak_10y >= 10)
 U["win_5x5y"] = U.eligible & (U.mult_peak_5y >= 5)
@@ -141,4 +152,5 @@ for y in SNAPS:
     print(f"{y}  {len(s):6d}  {int((s.mcap >= 300e6).sum()):6d}  {int(s.eligible.sum()):6d}  {int((s.shares_source == "none").sum()):6d}  "
           f"{int(s.win_10x10y.sum()):5d}  {int(s.win_5x5y.sum()):5d}  {bool(s.window_complete_10y.iloc[0]) if len(s) else None}")
 print("unique winners:", W.groupby("tag").ticker.nunique().to_dict())
-print("of which big_dividend-flagged:", W[W.big_dividend].groupby("tag").ticker.nunique().to_dict())
+print("of which big_dividend-flagged:", W[W.big_dividend].groupby("tag").ticker.nunique().to_dict(),
+      " odd_split-flagged:", W[W.odd_split].groupby("tag").ticker.nunique().to_dict())
