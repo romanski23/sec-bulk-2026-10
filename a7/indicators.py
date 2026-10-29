@@ -20,6 +20,8 @@ from features import FEATURES, build_monthly, features  # noqa: E402
 
 a7, quarterly, prices, filings, out_md = sys.argv[1:6]
 SETTING = sys.argv[6] if len(sys.argv) > 6 else "h25_t25"
+RUN_MODE = sys.argv[7] if len(sys.argv) > 7 else "first"      # "first": first XBRL-era run per winner; "all": every run
+DEDUP_DAYS = int(sys.argv[8]) if len(sys.argv) > 8 else 365   # episode spacing per stock; 0 = every qualifying month
 a7 = Path(a7)
 SEED = 20261029
 HORIZONS = [-12, -6, 0, 3, 6]
@@ -45,32 +47,37 @@ split = pd.DataFrame({"ticker": elig_tickers, "set": np.where(half.values, "disc
 split.to_csv(a7 / "split.csv", index=False)
 set_of = dict(zip(split.ticker, split.set))
 
-say(f"# A7 unified indicator test ({SETTING})\n")
+say(f"# A7 unified indicator test ({SETTING}; runs: {RUN_MODE}; episode spacing: {DEDUP_DAYS} days)\n")
 monthly = build_monthly(prices)
 Q = pd.read_parquet(quarterly)
 
 # ---------------- 1. horizon dataset ----------------
 MIN_RUN_START = pd.Timestamp("2012-07-01")   # XBRL covers all filers from mid-2011; a -12m observation needs fundamentals, so runs from mid-2012
-first_runs = R[pd.to_datetime(R.start) >= MIN_RUN_START].sort_values(["ticker", "run_no"]).drop_duplicates("ticker")[["ticker", "start", "run_no"]]
+first_runs = R[pd.to_datetime(R.start) >= MIN_RUN_START].sort_values(["ticker", "run_no"])[["ticker", "start", "run_no", "buy_months"]]
+if RUN_MODE == "first":
+    first_runs = first_runs.drop_duplicates("ticker")
 first_runs = first_runs[first_runs.ticker.isin(set(WH.ticker))]
-say(f"Horizon test uses each winner's first run starting on/after {MIN_RUN_START.date()} (data constraint: XBRL fundamentals); "
-    f"{len(first_runs)} winners, of which {int((first_runs.run_no == 1).sum())} are true first runs.\n")
+say(f"Horizon test: {'every run' if RUN_MODE == 'all' else 'first run per winner'} starting on/after {MIN_RUN_START.date()} (XBRL constraint); "
+    f"{len(first_runs)} runs on {first_runs.ticker.nunique()} winners; run-length distribution (buy months): median {first_runs.buy_months.median():.0f}, "
+    f">= 12 months: {(first_runs.buy_months >= 12).mean():.0%}.\n")
 obs = []
 for r in first_runs.itertuples():
     for h in HORIZONS:
-        obs.append(dict(ticker=r.ticker, run_start=r.start, horizon=h, obs_date=(pd.Timestamp(r.start) + pd.DateOffset(months=h)) + pd.offsets.MonthEnd(0), group="winner", winner=r.ticker))
+        obs.append(dict(ticker=r.ticker, run_start=r.start, run_no=r.run_no, horizon=h, obs_date=(pd.Timestamp(r.start) + pd.DateOffset(months=h)) + pd.offsets.MonthEnd(0), group="winner", winner=r.ticker))
 wobs = pd.DataFrame(obs); wobs["obs_date"] = pd.to_datetime(wobs.obs_date).astype("datetime64[ns]"); wobs["run_start"] = pd.to_datetime(wobs.run_start).astype("datetime64[ns]")
 # controls observed on their winner's dates (controls of the winner at its first qualifying snapshot, any tag)
 cw = C.merge(WH[["ticker", "snapshot", "tag"]].rename(columns={"ticker": "winner"}), on=["winner", "snapshot", "tag"])
 cw = cw.drop_duplicates(["winner", "control"])
 cobs = wobs.merge(cw[["winner", "control"]], on="winner").drop(columns=["ticker"]).rename(columns={"control": "ticker"})
+# a control observed on the same date for several runs of its winner is kept once per date
+cobs = cobs.drop_duplicates(["ticker", "obs_date", "horizon"])
 cobs["group"] = "control"
 H = pd.concat([wobs, cobs], ignore_index=True).merge(tk, on="ticker", how="left")
 H = H[H.cik.notna()]
 H = features(H, Q, monthly, filings)
 H["set"] = H.ticker.map(set_of).fillna("holdout")
 H["time_holdout"] = H.run_start >= "2019-01-01"
-H.to_parquet(a7 / "horizon_features.parquet", index=False)
+H.to_parquet(a7 / f"horizon_features_{RUN_MODE}.parquet", index=False)
 say(f"Horizon dataset: {H[H.group == 'winner'].ticker.nunique()} winners (first runs), {H[H.group == 'control'].ticker.nunique()} controls; rows {len(H):,}; "
     f"rows without fundamentals: {H.ttm_end.isna().mean():.0%}, without prices: {H.adj.isna().mean():.0%}")
 
@@ -80,7 +87,7 @@ B = B.sort_values(["ticker", "mo"])
 keep = []
 last = {}
 for r in B.itertuples():
-    if r.ticker in last and (r.mo - last[r.ticker]).days < 365:
+    if DEDUP_DAYS and r.ticker in last and (r.mo - last[r.ticker]).days < DEDUP_DAYS:
         keep.append(False)
     else:
         keep.append(True); last[r.ticker] = r.mo
@@ -95,7 +102,7 @@ B = B[B.cik.notna()]
 B = features(B[["ticker", "cik", "sic", "obs_date", "hit", "label"]], Q, monthly, filings)
 B["set"] = B.ticker.map(set_of)
 B["time_holdout"] = B.obs_date >= "2019-01-01"
-B.to_parquet(a7 / "breakout_features.parquet", index=False)
+B.to_parquet(a7 / f"breakout_features_d{DEDUP_DAYS}.parquet", index=False)
 say(f"Breakout dataset: {len(B):,} breakouts on {B.ticker.nunique():,} tickers; base rate (became a buy month): {B.hit.mean():.0%}; discovery {int((B.set == 'discovery').sum()):,} / holdout {int((B.set == 'holdout').sum()):,}; time holdout {int(B.time_holdout.sum()):,}\n")
 
 # ---------------- helpers ----------------
@@ -157,7 +164,7 @@ for r in HT[HT.bh].itertuples():
          and abs(d2) >= abs(r.d_disc) / 2 and abs(d3) >= abs(r.d_disc) / 2 and min(nw2, nc2, nw3, nc3) >= 15
     conf.append(dict(horizon=r.horizon, feature=r.feature, d_disc=r.d_disc, d_hold=d2, d_time=d3, n_w=r.n_w, n_c=r.n_c, confirmed=ok))
 HC = pd.DataFrame(conf)
-HT.to_csv(a7 / "horizon_tests.csv", index=False); HC.to_csv(a7 / "horizon_confirmed.csv", index=False)
+HT.to_csv(a7 / f"horizon_tests_{RUN_MODE}.csv", index=False); HC.to_csv(a7 / f"horizon_confirmed_{RUN_MODE}.csv", index=False)
 say(f"Feature-horizon pairs tested: {int(valid.sum())}; BH-significant on discovery: {int(HT.bh.sum())}; confirmed on both holdouts: {int(HC.confirmed.sum()) if len(HC) else 0}\n")
 if len(HC):
     say("| horizon | feature | d discovery | d holdout | d 2019+ | n winners | n controls | confirmed |")
@@ -198,7 +205,7 @@ def episode_test(B, name, note):
         conf.append(dict(feature=r.feature, diff_disc=r.diff_disc, top_disc=r.top, bot_disc=r.bot, diff_hold=d2, top_hold=t2, bot_hold=b2, diff_time=d3, n_disc=r.n, n_hold=n2, n_time=n3, confirmed=ok))
     BC = pd.DataFrame(conf)
     tag = name.lower()
-    BT.to_csv(a7 / f"{tag}_tests.csv", index=False); BC.to_csv(a7 / f"{tag}_confirmed.csv", index=False)
+    BT.to_csv(a7 / f"{tag}_tests_d{DEDUP_DAYS}.csv", index=False); BC.to_csv(a7 / f"{tag}_confirmed_d{DEDUP_DAYS}.csv", index=False)
     say(f"Features tested: {int(valid.sum())}; BH-significant on discovery: {int(BT.bh.sum())}; confirmed on both holdouts: {int(BC.confirmed.sum()) if len(BC) else 0}\n")
     if len(BC):
         say("| feature | discovery top / bottom tercile hit rate | holdout top / bottom | 2019+ diff | n discovery | confirmed |")
@@ -248,7 +255,7 @@ def episodes(mask_fn, name):
     E_ = E_[mask_fn(E_)].sort_values(["ticker", "mo"])
     keep = []; last = {}
     for r in E_.itertuples():
-        if r.ticker in last and (r.mo - last[r.ticker]).days < 365:
+        if DEDUP_DAYS and r.ticker in last and (r.mo - last[r.ticker]).days < DEDUP_DAYS:
             keep.append(False)
         else:
             keep.append(True); last[r.ticker] = r.mo
@@ -258,7 +265,7 @@ def episodes(mask_fn, name):
     E_ = E_.merge(tk, on="ticker", how="left"); E_ = E_[E_.cik.notna()]
     E_ = features(E_[["ticker", "cik", "sic", "obs_date", "hit", "label"]], Q, monthly, filings)
     E_["set"] = E_.ticker.map(set_of); E_["time_holdout"] = E_.obs_date >= "2019-01-01"
-    E_.to_parquet(a7 / f"{name.lower()}_features.parquet", index=False)
+    E_.to_parquet(a7 / f"{name.lower()}_features_d{DEDUP_DAYS}.parquet", index=False)
     say(f"{name} dataset: {len(E_):,} episodes on {E_.ticker.nunique():,} tickers; base rate {E_.hit.mean():.0%}")
     return E_
 
